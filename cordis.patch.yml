@@ -1,0 +1,14 @@
+# dsh-second-brain bundle patch: inserts the dual-face plugin row into the
+# profile roster.
+#
+# Node half (package root export ".") runs in the DSH host process: it owns the
+# Markdown knowledge vault, the auto-capture pipeline, the brain_* model tools,
+# the /second-brain HTTP face, and a system-prompt section telling the model the
+# brain exists.
+#
+# Browser half (package export "./client", declared by `dsh.client` in
+# package.json) runs in the Web GUI and registers one `settings.section` page:
+# the graphical knowledge base plus the interactive knowledge graph.
+- insert:
+    - id: second-brain
+      name: 'dsh-second-brain'

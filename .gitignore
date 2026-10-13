@@ -1,0 +1,9 @@
+# Workspace-local scratch used by the test suite.
+.test-tmp/
+node_modules/
+
+# macOS
+.DS_Store
+
+# Logs
+*.log

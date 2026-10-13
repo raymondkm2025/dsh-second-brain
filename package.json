@@ -1,0 +1,48 @@
+{
+  "name": "dsh-second-brain",
+  "version": "0.1.0",
+  "description": "DSH 第二大脑：对话结束自动沉淀本地 Markdown 知识卡（自研去重 + CJK 检索 + git 友好），设置页提供图形化知识库与交互式知识图谱",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./core": "./lib/core.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "LICENSE",
+    "README.md"
+  ],
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "second-brain",
+    "knowledge-base",
+    "knowledge-graph",
+    "markdown",
+    "notes"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ],
+      "platform": "web"
+    }
+  }
+}

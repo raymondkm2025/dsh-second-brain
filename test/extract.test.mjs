@@ -1,0 +1,350 @@
+import test from 'node:test'
+import assert from 'node:assert/strict'
+
+import {
+  blocksToText,
+  distillTurn,
+  flattenMessages,
+  inferKind,
+  isInjectedContext,
+  isLowValue,
+  lastTurn,
+  sessionDigest,
+  splitBlocks,
+  titleFromRequest,
+} from '../lib/extract.js'
+
+test('blocksToText reads text blocks and ignores everything else', () => {
+  assert.equal(blocksToText('plain'), 'plain')
+  assert.equal(
+    blocksToText([
+      { type: 'text', text: 'hello' },
+      { type: 'tool-call', id: 'x', name: 'bash', arguments: '{}' },
+      { type: 'text', text: 'world' },
+    ]),
+    'hello\nworld',
+  )
+  assert.equal(blocksToText(undefined), '')
+})
+
+test('isInjectedContext recognises the harness runtime-context blocks', () => {
+  const samples = [
+    'Current runtime context. This snapshot supersedes earlier runtime-context snapshots.',
+    'Time sampled while preparing turn 1, step 184: 2026-10-13T10:40:53+08:00[Asia/Hong_Kong]',
+    'Elapsed since the preceding step context: 14m 35s.',
+    'You are an AI agent powered by DeepSeek Harness.',
+    'You are interacting with the user through the DeepSeek Harness Web GUI at http://127.0.0.1:19387.',
+    'Tokens prefixed with @ are paths the user explicitly referenced.',
+    'Agent Teams is available in this session, but create teammates only when the user explicitly asks.',
+    '# Current runtime context. (after a markdown heading marker)',
+  ]
+  for (const sample of samples) {
+    assert.equal(isInjectedContext(sample), true, sample.slice(0, 40))
+  }
+  const requests = [
+    'develop a dsh plugin 给 DeepSeek Harness 装上自研「第二大脑」',
+    '帮我看看为什么插件加载失败',
+    '',
+    '   ',
+    '在 README 里补一段说明：Time sampled while preparing turn 会出现在会话日志里。',
+  ]
+  for (const sample of requests) {
+    assert.equal(isInjectedContext(sample), false, sample.slice(0, 40))
+  }
+})
+
+test('flattenMessages keeps only user and assistant text', () => {
+  const flat = flattenMessages([
+    { role: 'system', content: [{ type: 'text', text: 'sys' }] },
+    { role: 'user', content: [{ type: 'text', text: '问题' }] },
+    { role: 'tool', content: [{ type: 'text', text: 'tool output' }] },
+    { role: 'assistant', content: [{ type: 'text', text: '答案' }] },
+    { role: 'assistant', content: [] },
+  ])
+  assert.deepEqual(flat, [
+    { role: 'user', text: '问题' },
+    { role: 'assistant', text: '答案' },
+  ])
+})
+
+test('flattenMessages drops injected context so lastTurn finds the real request', () => {
+  const flat = flattenMessages([
+    { role: 'user', content: [{ type: 'text', text: 'develop a dsh plugin' }] },
+    { role: 'assistant', content: [{ type: 'text', text: 'working on it' }] },
+    { role: 'user', content: [{ type: 'text', text: 'Current runtime context. This snapshot supersedes earlier ones.' }] },
+    { role: 'assistant', content: [{ type: 'text', text: 'still working' }] },
+    { role: 'user', content: [{ type: 'text', text: 'Time sampled while preparing turn 1, step 91: 2026-10-13T09:33:43+08:00' }] },
+  ])
+  assert.deepEqual(flat, [
+    { role: 'user', text: 'develop a dsh plugin' },
+    { role: 'assistant', text: 'working on it' },
+    { role: 'assistant', text: 'still working' },
+  ])
+  assert.deepEqual(lastTurn(flat)[0], { role: 'user', text: 'develop a dsh plugin' })
+  // The escape hatch keeps them when a caller wants the raw transcript.
+  assert.equal(flattenMessages([{ role: 'user', content: [{ type: 'text', text: 'Current runtime context.' }] }], { keepInjected: true }).length, 1)
+})
+
+test('lastTurn slices from the final user message', () => {
+  const flat = [
+    { role: 'user', text: 'u1' },
+    { role: 'assistant', text: 'a1' },
+    { role: 'user', text: 'u2' },
+    { role: 'assistant', text: 'a2' },
+  ]
+  assert.deepEqual(lastTurn(flat), [
+    { role: 'user', text: 'u2' },
+    { role: 'assistant', text: 'a2' },
+  ])
+  assert.deepEqual(lastTurn([{ role: 'assistant', text: 'only' }]), [{ role: 'assistant', text: 'only' }])
+})
+
+test('splitBlocks separates prose from fenced code with its language', () => {
+  const blocks = splitBlocks('前言\n\n```ts\nconst a = 1\n```\n\n后记\n')
+  assert.deepEqual(blocks.map((block) => block.type), ['prose', 'code', 'prose'])
+  assert.equal(blocks[1].lang, 'ts')
+  assert.equal(blocks[1].text.trim(), 'const a = 1')
+})
+
+test('isLowValue flags acknowledgements and short chatter, not real answers', () => {
+  assert.equal(isLowValue('好的'), true)
+  assert.equal(isLowValue('ok'), true)
+  assert.equal(isLowValue('明白了，谢谢'), true)
+  assert.equal(isLowValue('这个问题的根因是配置项没有生效，因为 profile 的 patch 层覆盖了 bundle 的默认值。'), false)
+  assert.equal(isLowValue('```js\nconst a = 1\n```'), false)
+})
+
+test('titleFromRequest cleans markers and clamps', () => {
+  assert.equal(titleFromRequest('## 帮我设计一个插件\n\n细节'), '帮我设计一个插件')
+  assert.equal(titleFromRequest('- 第一条\n- 第二条'), '第一条')
+  assert.equal(titleFromRequest('   '), '未命名知识卡')
+  assert.equal(Array.from(titleFromRequest('长'.repeat(200))).length, 61)
+})
+
+test('inferKind classifies snippets, decisions and procedures', () => {
+  assert.equal(inferKind({ prose: '说明', codeBlocks: [{ lang: 'ts', text: 'x'.repeat(500) }] }), 'snippet')
+  assert.equal(inferKind({ prose: '我们的结论是采用方案 B。', codeBlocks: [] }), 'decision')
+  assert.equal(inferKind({ prose: '首先安装依赖，然后运行命令。', codeBlocks: [] }), 'procedure')
+  assert.equal(inferKind({ prose: 'DSH 是一个 harness。', codeBlocks: [] }), 'fact')
+})
+
+test('distillTurn: a substantive answer with code yields a card plus a snippet card', () => {
+  const assistantText = [
+    '构建 DSH 插件需要两个文件，缺一不可。',
+    '',
+    '首先创建 package.json，声明 dsh.bundle.patch 与 exports；',
+    '然后在 cordis.patch.yml 里插入插件行。',
+    '',
+    '```js',
+    "export const name = 'my-plugin'",
+    'export const inject = ["tools"]',
+    'export function apply(ctx) {',
+    '  ctx.effect(() => ctx.tools.register(tool), "my-plugin: tool")',
+    '}',
+    '```',
+    '',
+    '注意：inject 里列出的服务必须真实存在，否则插件会一直等待。',
+  ].join('\n')
+  const { drafts, reason } = distillTurn({
+    messages: [
+      { role: 'user', text: '怎么开发一个 dsh 插件？' },
+      { role: 'assistant', text: assistantText },
+    ],
+    sessionId: 'session-1',
+    cwd: '/tmp',
+    turn: 4,
+    now: 1000,
+    options: { minChars: 100, minCodeLines: 3, minCodeChars: 40 },
+  })
+  assert.equal(reason, 'ok')
+  assert.ok(drafts.length >= 2, `expected a main card and a snippet card, got ${drafts.length}`)
+  const main = drafts.find((draft) => draft.kind !== 'snippet')
+  assert.ok(main !== undefined, 'a prose card exists alongside the snippet')
+  assert.equal(main.title, '怎么开发一个 dsh 插件？')
+  assert.equal(main.kind, 'procedure', 'a card that merely contains code is still a procedure')
+  assert.equal(main.provenance[0], 'session-1#/tmp#turn4')
+  assert.ok(main.body.includes('缺一不可'))
+  assert.ok(!main.body.includes('```'), 'the main card body must not inline the code block')
+  assert.ok(main.hash.length > 0)
+  const snippet = drafts.find((draft) => draft.body.startsWith('```'))
+  assert.ok(snippet !== undefined, 'a substantial code block becomes its own card')
+  assert.equal(snippet.lang, 'js')
+  assert.ok(snippet.tags.includes('js'))
+  assert.ok(snippet.body.startsWith('```js'))
+})
+
+test('distillTurn uses the final answer, not the intermediate narration', () => {
+  const { drafts, reason } = distillTurn({
+    messages: [
+      { role: 'user', text: '怎么给 DSH 写一个插件？' },
+      { role: 'assistant', text: 'Let me look at the plugin layout first, then I will write the manifest.' },
+      { role: 'assistant', text: 'Now I will add the patch row and re-run the loader.' },
+      {
+        role: 'assistant',
+        text: [
+          'DSH 插件由两个文件定义：`package.json` 声明双半出口与 `dsh.bundle.patch`，',
+          '`cordis.patch.yml` 把插件行插入 profile 花名册。宿主半导出 `apply(ctx)`，',
+          '浏览器半是一个 `__ModuleLoader__` 工厂。缺任何一个，插件都不会被加载，',
+          '而且不会有明显报错，只会表现为工具列表里没有它的工具。',
+        ].join('\n'),
+      },
+    ],
+    sessionId: 'session-2',
+    turn: 2,
+    now: 2000,
+    options: { minChars: 100 },
+  })
+  assert.equal(reason, 'ok')
+  assert.equal(drafts.length, 1)
+  // The narration must not leak into the card.
+  assert.ok(!drafts[0].body.includes('Let me look at the plugin layout'))
+  assert.ok(!drafts[0].body.includes('Now I will add the patch row'))
+  assert.ok(drafts[0].body.includes('DSH 插件由两个文件定义'))
+  assert.equal(drafts[0].title, '怎么给 DSH 写一个插件？')
+})
+
+test('regression: the exact transcript shape that produced a timestamp-titled card', () => {
+  // Verbatim replay of a real failure. A long multi-step turn delivered the
+  // harness runtime context as a user-role message, and every assistant message
+  // was process narration; the capture produced a card titled
+  // "Time sampled while preparing turn 1, step 184: 2026-10-13T10…" whose body
+  // was the narration. Both halves of the fix are asserted here.
+  const messages = [
+    { role: 'user', content: [{ type: 'text', text: 'develop a dsh plugin — 给 DeepSeek Harness 装上自研「第二大脑」' }] },
+    { role: 'assistant', content: [{ type: 'text', text: 'I will start by reconning the plugin contracts.' }] },
+    { role: 'user', content: [{ type: 'text', text: 'Time sampled while preparing turn 1, step 184: 2026-10-13T10:40:53+08:00[Asia/Hong_Kong]' }] },
+    { role: 'assistant', content: [{ type: 'text', text: 'Rather than disrupt the live session by toggling the plugin, let me apply the tuned thresholds.' }] },
+    { role: 'user', content: [{ type: 'text', text: 'Current runtime context. This snapshot supersedes earlier runtime-context snapshots.' }] },
+    { role: 'assistant', content: [{ type: 'text', text: 'Dedupe now works through the live plugin. Let me verify the merge result and the read paths.' }] },
+    {
+      role: 'assistant',
+      content: [{
+        type: 'text',
+        text: [
+          '第二大脑的自动沉淀分两步：先把本轮最终回答里的结论提炼成要点卡，',
+          '再把整轮里出现过的成形代码块各自提炼成片段卡。去重是两级的——',
+          'MinHash 签名负责快速筛掉无关卡片，精确的词元集合比较给出最终判定，',
+          '因此同一份知识的改写会被合并，而同主题不同内容的卡片不会互相吞掉。',
+        ].join('\n'),
+      }],
+    },
+  ]
+  const { drafts, reason } = distillTurn({
+    messages: flattenMessages(messages),
+    sessionId: 'session-760c0299',
+    cwd: '/Users/raymond/Documents/dsh_workspace',
+    turn: 0,
+    now: 4000,
+    options: { minChars: 100 },
+  })
+  assert.equal(reason, 'ok')
+  assert.equal(drafts.length, 1)
+  assert.match(drafts[0].title, /develop a dsh plugin/)
+  assert.ok(!drafts[0].title.includes('Time sampled'))
+  assert.ok(drafts[0].body.includes('MinHash 签名负责快速筛掉无关卡片'))
+  assert.ok(!drafts[0].body.includes('Rather than disrupt the live session'))
+  assert.ok(!drafts[0].body.includes('Dedupe now works through the live plugin'))
+})
+
+test('distillTurn harvests code snippets from every step of the turn', () => {
+  const snippet = [
+    '```bash',
+    'pnpm add /path/to/dsh-second-brain',
+    'pnpm run build',
+    'pnpm test',
+    '```',
+  ].join('\n')
+  const { drafts } = distillTurn({
+    messages: [
+      { role: 'user', text: '怎么安装这个插件？' },
+      { role: 'assistant', text: `先安装依赖：\n\n${snippet}` },
+      { role: 'assistant', text: '装完之后重启 DSH 即可。再补充一句足够长的收尾说明，让最终回答本身也超过最小长度阈值，便于验证叙述卡来自最后一条消息而不是中间步骤。' },
+    ],
+    sessionId: 'session-3',
+    turn: 3,
+    now: 3000,
+    options: { minChars: 40, minCodeLines: 3 },
+  })
+  const snippets = drafts.filter((draft) => draft.body.startsWith('```'))
+  assert.equal(snippets.length, 1, 'code from an earlier step still becomes a card')
+  assert.ok(snippets[0].body.includes('pnpm test'))
+})
+
+test('the prose card points at the snippet cards it generated', () => {
+  const assistant = [
+    '插件要同时提供宿主半与浏览器半，两者缺一不可。',
+    '',
+    '```js',
+    "export const name = 'my-plugin'",
+    'export const inject = ["tools"]',
+    'export function apply(ctx) {',
+    '  ctx.effect(() => ctx.tools.register(tool), "x")',
+    '}',
+    '```',
+    '',
+    '浏览器半必须用 __ModuleLoader__ 工厂的形式交付，否则加载器不会认识它。',
+  ].join('\n')
+  const { drafts } = distillTurn({
+    messages: [{ role: 'user', text: '插件怎么分两半？' }, { role: 'assistant', text: assistant }],
+    sessionId: 's',
+    turn: 1,
+    now: 1,
+    options: { minChars: 80, minCodeLines: 3, minCodeChars: 40 },
+  })
+  const prose = drafts.find((draft) => !draft.body.startsWith('```'))
+  assert.ok(prose !== undefined)
+  // The fence is gone from the prose card, so a reader needs the back-reference.
+  assert.ok(!prose.body.includes('```'), 'the fenced block is not inlined')
+  assert.ok(prose.body.includes('代码片段已单独存为知识卡'), `missing pointer in: ${prose.body}`)
+  assert.equal(drafts.filter((draft) => draft.body.startsWith('```')).length, 1)
+
+  // No code at all -> no pointer sentence.
+  const plain = distillTurn({
+    messages: [{ role: 'user', text: 'q' }, { role: 'assistant', text: '这是一段没有任何代码的说明文字，用来确认没有代码时不会插入指向片段卡的提示句。' }],
+    sessionId: 's',
+    turn: 2,
+    now: 2,
+    options: { minChars: 20 },
+  })
+  assert.ok(!plain.drafts[0].body.includes('已单独存为知识卡'))
+})
+
+test('distillTurn skips a turn that carries nothing reusable', () => {
+  const short = distillTurn({
+    messages: [{ role: 'user', text: 'hi' }, { role: 'assistant', text: '你好！' }],
+    options: { minChars: 100 },
+  })
+  assert.deepEqual(short.drafts, [])
+  assert.match(short.reason, /too short/)
+
+  const filler = distillTurn({
+    messages: [{ role: 'user', text: 'ok?' }, { role: 'assistant', text: '好的，明白了。'.repeat(20) }],
+    options: { minChars: 10 },
+  })
+  assert.deepEqual(filler.drafts, [])
+})
+
+test('distillTurn honours an explicit "remember this" request even with a short reply', () => {
+  const note = '记住：这个项目的知识库放在 ~/.dsh/second-brain/vault，用 git 管理，每张卡一个 Markdown 文件，不要提交生成物。'
+  const { drafts } = distillTurn({
+    messages: [{ role: 'user', text: note }, { role: 'assistant', text: '好的。' }],
+    sessionId: 's',
+    turn: 1,
+    now: 5,
+    options: { minChars: 1000 },
+  })
+  assert.equal(drafts.length, 1)
+  assert.equal(drafts[0].kind, 'note')
+  assert.ok(drafts[0].body.includes('~/.dsh/second-brain/vault'))
+  assert.ok(drafts[0].tags.includes('note'))
+})
+
+test('sessionDigest is bounded and keeps both roles', () => {
+  const flat = [
+    { role: 'user', text: 'a'.repeat(5000) },
+    { role: 'assistant', text: 'b'.repeat(5000) },
+  ]
+  const digest = sessionDigest(flat, { maxChars: 600 })
+  assert.ok(digest.length <= 600)
+  assert.ok(digest.includes('## 用户'))
+})
