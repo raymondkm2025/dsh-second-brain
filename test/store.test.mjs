@@ -190,7 +190,8 @@ test('vault search, graph, merge, export/import and delete', () => {
     assert.deepEqual(merged.removed, ['kb-c'])
     assert.equal(vault.list().length, 2)
     assert.equal(readdirSync(join(root, 'cards')).length, 2, 'the renamed survivor does not leave a stray file')
-    assert.match(merged.card.file, /^2026-10-13-图谱可视化-合并--a\.md$/)
+    // Date-agnostic: the card is stamped with the day the merge ran.
+    assert.match(merged.card.file, /^\d{4}-\d{2}-\d{2}-图谱可视化-合并--a\.md$/)
     assert.ok(merged.card.tags.includes('svg'))
     assert.ok(merged.card.tags.includes('图谱'))
 

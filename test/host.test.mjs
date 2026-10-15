@@ -626,15 +626,54 @@ test('brain_capture tool reports when no session is bound', async () => {
   }
 })
 
-test('LLM distillation parses a fenced JSON array and falls back on garbage', () => {
-  const drafts = parseDraftJson('这是结果：\n```json\n[{"title":"标题","body":"正文","kind":"decision","tags":["A","B"]}]\n```\n完毕')
-  assert.equal(drafts.length, 1)
-  assert.equal(drafts[0].title, '标题')
-  assert.equal(drafts[0].kind, 'decision')
-  assert.deepEqual(drafts[0].tags, ['a', 'b'])
-  assert.equal(parseDraftJson('no json here'), null)
-  assert.equal(parseDraftJson('[{"title":"","body":"x"}]'), null)
-  assert.equal(parseDraftJson('[not json]'), null)
+test('LLM distillation separates a valid verdict from an unusable reply', () => {
+  const ok = parseDraftJson('这是结果：\n```json\n[{"title":"标题","body":"正文","kind":"decision","tags":["A","B"]}]\n```\n完毕')
+  assert.equal(ok.ok, true)
+  assert.equal(ok.drafts.length, 1)
+  assert.equal(ok.drafts[0].title, '标题')
+  assert.equal(ok.drafts[0].kind, 'decision')
+  assert.deepEqual(ok.drafts[0].tags, ['a', 'b'])
+
+  // An empty array is the model's DECISION that nothing is reusable. Treating
+  // it as a failure is what let the heuristics override the verdict.
+  const empty = parseDraftJson('[]')
+  assert.equal(empty.ok, true)
+  assert.deepEqual(empty.drafts, [])
+  assert.equal(parseDraftJson('```json\n[]\n```').ok, true)
+
+  // Genuinely unusable answers are failures.
+  assert.equal(parseDraftJson('no json here').ok, false)
+  assert.equal(parseDraftJson('[not json]').ok, false)
+  assert.equal(parseDraftJson('[{"title":"","body":"x"}]').ok, true, 'entries without a title are dropped, not fatal')
+  assert.deepEqual(parseDraftJson('[{"title":"","body":"x"}]').drafts, [])
+  assert.equal(parseDraftJson('{"title":"x"}').ok, false, 'an object is not an array of drafts')
+})
+
+test('a model verdict of "nothing worth keeping" is respected, not overridden', async () => {
+  const messages = [
+    { role: 'user', content: [{ type: 'text', text: '把仓库推上去' }] },
+    { role: 'assistant', content: [{ type: 'text', text: '仓库已推送，凭据已存进钥匙串，main 与远端一致。'.repeat(6) }] },
+  ]
+  const sessions = new Map([['session-test', fakeSession(messages)]])
+  const emptyStream = async function* () {
+    yield { type: 'text-delta', index: 0, text: '[]' }
+    yield { type: 'finish', reason: { kind: 'stop' } }
+  }
+  const brain = await boot({
+    sessions,
+    defaultModel: { currentSelection: () => ({ provider: 'p', model: 'm' }) },
+    llm: { stream: () => emptyStream() },
+  })
+  try {
+    await call(brain.routes[0], 'POST', '/second-brain/config', { patch: { capture: 'llm', minChars: 100 } })
+    const captured = await brain.captureSession({ sessionId: 'session-test', turn: 1 })
+    assert.equal(captured.mode, 'llm')
+    assert.equal(captured.skipped, true)
+    assert.match(captured.reason, /无可沉淀/)
+    assert.equal(brain.vault().list().length, 0, 'the heuristics must not run behind the model back')
+  } finally {
+    brain.cleanup()
+  }
 })
 
 test('llm capture mode uses the model, and degrades when the model fails', async () => {
