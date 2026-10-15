@@ -736,11 +736,28 @@ test('llm capture mode uses the model, and degrades when the model fails', async
     yield { type: 'text-delta', index: 0, text: '抱歉，我无法处理。' }
     yield { type: 'finish', reason: { kind: 'stop' } }
   }
+  // Default: a failed model call SKIPS the turn. Substituting the heuristics
+  // here is what filled the knowledge base with cards titled after the user's
+  // own message, so it is now opt-in.
+  const skipped = await boot({ sessions, defaultModel, llm: { stream: () => badStream() } })
+  try {
+    await call(skipped.routes[0], 'POST', '/second-brain/config', { patch: { capture: 'llm', minChars: 120 } })
+    const captured = await skipped.captureSession({ sessionId: 'session-test', turn: 2 })
+    assert.equal(captured.skipped, true)
+    assert.equal(captured.mode, 'llm')
+    assert.match(captured.reason, /模型提炼不可用/)
+    assert.equal(captured.created, 0)
+    assert.equal(skipped.vault().list().length, 0, 'an unusable model answer must not seed the heuristics')
+  } finally {
+    skipped.cleanup()
+  }
+
+  // Opt-in: the old behaviour is one setting away.
   const fallback = await boot({ sessions, defaultModel, llm: { stream: () => badStream() } })
   try {
-    await call(fallback.routes[0], 'POST', '/second-brain/config', { patch: { capture: 'llm', minChars: 120 } })
+    await call(fallback.routes[0], 'POST', '/second-brain/config', { patch: { capture: 'llm', minChars: 120, heuristicFallback: true } })
     const captured = await fallback.captureSession({ sessionId: 'session-test', turn: 2 })
-    assert.equal(captured.mode, 'heuristic', 'an unusable model answer degrades to the heuristic path')
+    assert.equal(captured.mode, 'heuristic', 'heuristicFallback: true restores the fallback')
     assert.ok(captured.created >= 1)
   } finally {
     fallback.cleanup()
@@ -750,8 +767,20 @@ test('llm capture mode uses the model, and degrades when the model fails', async
   try {
     await call(noLlm.routes[0], 'POST', '/second-brain/config', { patch: { capture: 'llm', minChars: 120 } })
     const captured = await noLlm.captureSession({ sessionId: 'session-test', turn: 3 })
-    assert.equal(captured.mode, 'heuristic')
+    assert.equal(captured.mode, 'llm')
+    assert.equal(captured.skipped, true, 'no llm service at all is also a skip')
   } finally {
     noLlm.cleanup()
+  }
+
+  // Explicit heuristic mode is unaffected by any of this.
+  const heuristic = await boot({ sessions, defaultModel })
+  try {
+    await call(heuristic.routes[0], 'POST', '/second-brain/config', { patch: { minChars: 120 } })
+    const captured = await heuristic.captureSession({ sessionId: 'session-test', turn: 4 })
+    assert.equal(captured.mode, 'heuristic')
+    assert.ok(captured.created >= 1, 'capture: heuristic still extracts without a model')
+  } finally {
+    heuristic.cleanup()
   }
 })
