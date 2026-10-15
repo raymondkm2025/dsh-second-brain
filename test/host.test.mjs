@@ -649,6 +649,35 @@ test('LLM distillation separates a valid verdict from an unusable reply', () => 
   assert.equal(parseDraftJson('{"title":"x"}').ok, false, 'an object is not an array of drafts')
 })
 
+test('a truncated model answer is salvaged, not treated as a failure', () => {
+  // A long turn can push the answer past the token budget mid-array. The
+  // complete entries before the cut are valid drafts; reporting a failure here
+  // is what sent the capture down the heuristic path.
+  const items = [
+    { title: '甲', body: '甲的正文', kind: 'fact', tags: ['a'] },
+    { title: '乙', body: '乙的正文', kind: 'fact', tags: ['b'] },
+    { title: '丙', body: '丙的正文', kind: 'fact', tags: ['c'] },
+  ]
+  const full = JSON.stringify(items)
+  const cut = full.slice(0, full.length - 40)
+  const r = parseDraftJson(cut)
+  assert.equal(r.ok, true, 'a truncation is a partial answer, not a failure')
+  assert.deepEqual(r.drafts.map((d) => d.title), ['甲', '乙'])
+
+  // The scanner must not be fooled by braces or escapes inside a body.
+  const tricky = JSON.stringify([
+    { title: '含括号', body: '代码：if (x) { y() } 结束', kind: 'snippet', tags: [] },
+    { title: '含引号', body: '他说 "}" 然后停了', kind: 'note', tags: [] },
+  ])
+  const trickyCut = tricky.slice(0, tricky.length - 20)
+  const t = parseDraftJson(trickyCut)
+  assert.equal(t.ok, true)
+  assert.deepEqual(t.drafts.map((d) => d.title), ['含括号'])
+
+  // Cut before even one complete object: nothing to salvage, so it is a failure.
+  assert.equal(parseDraftJson('[{"title":"甲","bo').ok, false)
+})
+
 test('a model verdict of "nothing worth keeping" is respected, not overridden', async () => {
   const messages = [
     { role: 'user', content: [{ type: 'text', text: '把仓库推上去' }] },
